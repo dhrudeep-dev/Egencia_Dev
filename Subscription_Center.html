@@ -1,0 +1,1570 @@
+<script language="javascript" runat="server"> 
+Platform.Load("core","1");
+
+// Author: Eliot Harper, CloudKettle
+// Last Revision: October 13, 2020
+
+// Revision History
+/* Oct 5: changed Mktg_Alerts_Alerts__c to Travel_Alerts_Opt_In__c
+   Oct 13: fixed filterByNum() for travelAlerts (changed arg val from 5 to 4)
+*/
+
+
+// start global vars
+/* 
+// UAT VARS
+var baseUrl = 'https://wwwegenciacom.int-maui.sb.karmalab.net'; // supplied by Egencia
+var clientId = '2205392c-1872-44dd-8ecf-71d22823ae5d'; // supplied by Egencia
+var clientSecret = '1ZGLMqtrBzN3JobIGdQ6MfiOffDONFyG'; // supplied by Egencia
+*/
+
+
+// PROD VARS
+var baseUrl = 'https://www.egencia.com'; 
+var clientId = '61291c73-9df9-4824-95f5-67bc9e9418ac';
+var clientSecret = 'sT5ZCf1yGZWN-eSn242Eb64U5JbMPxED';
+var tsKey = 'sub-center-errors'; // customer key of triggered send for error emails
+var tsEmail = 'sabuhi@cloudkettle.com'; // email address to send error emails
+var tsSk = 'sfmc-alerts'; // subscriber key to send error emails
+var debug = Platform.Request.GetQueryStringParameter('debug');
+var mid = Platform.Function.AuthenticatedMemberID();
+
+if (mid==500009222) { // crisis comms BU
+   var cloudPageId = 1204; // id of published CloudPage
+} else { // parent BU
+   var cloudPageId = 711;
+}
+
+// end global vars
+
+
+if (debug) {
+ debug = true;
+ Variable.SetValue('@debug', debug);
+}
+
+Variable.SetValue('@cloudPageId', cloudPageId);
+
+var clientIp = Platform.Request.ClientIP;
+Variable.SetValue('@clientIp', clientIp);
+var userAgent = Platform.Request.UserAgent;
+Variable.SetValue('@userAgent', userAgent);
+
+var credentials = Platform.Function.Base64Encode(clientId + ':' + clientSecret);
+var auth = 'Basic ' + credentials;
+Variable.SetValue('@auth', auth);
+
+var token = Platform.Request.GetQueryStringParameter('token')
+Variable.SetValue('@token', token);
+
+if (token && Request.Method != 'POST') { // validate token
+
+try {
+
+   var route = '/auth-service/v1/tokens/validate-security-token';
+   var url = baseUrl + route;
+   var contentType = 'application/x-www-form-urlencoded';
+   var payload = 'security_token=' + token;
+   var headerNames = ['Accept-Encoding', 'Authorization'];
+   var headerValues = ['gzip, deflate, sdch, br', auth];
+   var result = [0];
+   var statusCode = Platform.Function.HTTPPost(url, contentType, payload, headerNames, headerValues, result);
+   /*Write('\n\nurl: ' + url);
+   Write('\n\ncredentials: ' + credentials);
+   Write('\n\npayload: ' + payload);*/
+
+   if (statusCode==200) {
+      var obj = Platform.Function.ParseJSON(result[0]);
+      var email = obj.email_id.replace(' ', '+'); // fixes ssjs bug in + being removed
+
+      Variable.SetValue('@companyId', obj.company_id);
+      Variable.SetValue('@userId', obj.user_id);
+      Variable.SetValue('@principalId', obj.principal_user_id);
+      Variable.SetValue('@emailAddr', email); 
+
+   } else {
+         Variable.SetValue('@logError', 'unable to validate token');
+         Variable.SetValue('@msg', 1);
+   }
+    
+} catch (e) { 
+      Variable.SetValue('@logError', 'response: ' + Stringify(e) + ' result: ' + Stringify(result));
+   }
+         
+}
+
+</script>
+
+%%[
+
+var @sk, @contactRows, @submitted, @startLine, @endLine, @env, @role, @prefLang
+
+set @startLine = '<pre style="background-color:#ccc;white-space:pre-wrap;word-wrap:break-word;margin-bottom:0;padding:10px 10px 0;"><code>'
+set @endLine = '</code></pre>'
+
+/* start identify Subscriber */
+
+if Empty(@emailAddr) then /* link from email */
+   set @emailAddr = emailaddr
+   set @sk = _subscriberKey
+
+elseif not Empty(@emailAddr) then /* visit from Egencia, get Contact Id, match on email */
+   var @contactRows
+
+   set @contactRows = RetrieveSalesforceObjects(
+      'Contact',
+      'Id',
+      'Email', '=', @emailAddr)
+
+   var @contactRowCount
+
+   set @contactRowCount = RowCount(@contactRows)
+
+   if @contactRowCount == 1 then /* should only be 1 contact with matching email */
+
+      var @contactRow
+
+         set @contactRow = Row(@contactRows, 1)
+         set @sk = Field(@contactRow, 'Id')
+
+         if @debug==true then
+            OutputLine(Concat(@startLine, 'Contact Id: ', @sk, @endLine))
+         endif
+
+      next
+
+   else /* check acr */
+      var @acrRows, @isAcr
+
+      set @acrRows = RetrieveSalesforceObjects(
+         'AccountContactRelation',
+         'ContactId',
+         'Email__c', '=', @emailAddr,
+         'IsDirect', '=', 'true')
+
+      var @acrRowCount
+
+      set @acrRowCount = RowCount(@acrRows)
+
+      if @debug==true then
+         OutputLine(Concat(@startLine, 'ACR row count ', @acrRowCount, @endLine))
+      endif
+
+      if @acrRowCount==1 then
+
+         var @i, @acrRow
+         set @acrRow = Row(@acrRows, 1)
+         set @sk = Field(@acrRow, 'ContactId')
+         set @isAcr = true
+         if @debug==true then
+            OutputLine(Concat(@startLine, 'ACR Id: ', @sk, @endLine))
+         endif
+
+      else
+         set @msg = 3
+         set @isAcr = false
+      endif
+
+   endif
+
+endif
+
+if @debug==true then
+   OutputLine(Concat(@startLine, 'emailAddr: ', @emailAddr, @endLine))
+   OutputLine(Concat(@startLine, 'sk: ', @sk, @endLine))
+   OutputLine(Concat(@startLine, 'errorMsg: ', @msg, @endLine))
+   OutputLine(Concat(@startLine, 'isAcr: ', @isAcr, @endLine))
+endif
+
+/* end identify Subscriber */
+
+set @submitted = RequestParameter('submitted')
+
+if Empty(@sk) and @submitted != 'submitted' then /* i.e. no query string params */
+   set @msg = 1
+endif
+
+if @submitted != 'submitted' and Empty(@msg) then
+
+  /* start locate contact */
+
+   set @contactRows = RetrieveSalesforceObjects(
+   'Contact',
+   'Account_Type__c,Admin_Mail_Opt_In__c,Main_Contact_Flag__c',
+   'Id', '=', @sk)
+
+   if @isAcr == false or RowCount(@contactRows)==1 then 
+
+      var @contactRow, @accountType, @adminMailOptIn, @mainContactFlag, @emailTypes
+
+      set @contactRow = Row(@contactRows, 1)
+      set @accountType = Field(@contactRow, 'Account_Type__c')
+      set @adminMailOptIn = Field(@contactRow, 'Admin_Mail_Opt_In__c')
+      set @mainContactFlag = Field(@contactRow, 'Main_Contact_Flag__c')
+
+      if @accountType == 'Customer' and (@mainContactFlag == true or @adminMailOptIn == true) then /* cannot use 1 in comparison */
+         set @role = 'Travel_Manager'
+         set @emailTypes = 'bestPractices;productUpdates;events;travelAlerts;surveys'
+      endif
+
+       if @debug==true then
+         OutputLine(Concat(@startLine, 'accountType: ', @accountType, @endLine))
+         OutputLine(Concat(@startLine, 'adminMailOptIn: ', @adminMailOptIn, @endLine))
+         OutputLine(Concat(@startLine, 'mainContactFlag: ', @mainContactFlag, @endLine))
+         OutputLine(Concat(@startLine, 'role: ', @role, @endLine))
+      endif
+
+   endif
+
+   if @isAcr == true or @role != 'Travel_Manager' then
+
+   set @acrRows = RetrieveSalesforceObjects(
+   'AccountContactRelation',
+   'Email__c,Egencia_Roles__c,AccountId,Display_Language_Code__c',
+   'Email__c', '=', @emailAddr,
+   'IsDirect', '=', 'true')
+
+   /* get most recent record */
+
+      set @acrRowCount = RowCount(@acrRows)
+
+      if @acrRowCount==1 then /* there should only be one */
+
+      var @i, @acrRow, @acrEmail, @egenciaRoles, @accountId
+
+      set @acrRow = Row(@acrRows, 1)
+      set @acrEmail = Field(@acrRow, 'Email__c')
+      set @egenciaRoles = Field(@acrRow, 'Egencia_Roles__c')
+      set @accountId = Field(@acrRow, 'AccountId')
+      set @prefLang = Field(@acrRow, 'Display_Language_Code__c')
+
+      if @debug==true then
+         OutputLine(Concat(@startLine, 'ACR accountId: ', @accountId, @endLine))
+         OutputLine(Concat(@startLine, 'ACR Display_Language_Code__c: ', @prefLang, @endLine))
+      endif  
+
+      else
+
+         set @logError = 'Email not found in ACR object'
+
+      endif
+
+         if @debug==true then
+            OutputLine(Concat(@startLine, 'acrEmail: ', @acrEmail, @endLine))
+            OutputLine(Concat(@startLine, 'egenciaRoles: ', @egenciaRoles, @endLine))
+            OutputLine(Concat(@startLine, 'accountId: ', @accountId, @endLine))
+         endif
+
+      endif
+
+   endif
+
+   if @emailAddr == @acrEmail then
+
+      var @accRows
+      set @accRows = LookupRows('ENT.Account_Salesforce', 'Id', @accountId)
+
+      set @accRows = RetrieveSalesforceObjects(
+      'Account',
+      'Mktg_Alerts_Special_Offers__c,Mktg_program_adoption_product_update__c',
+      'Id', '=', @accountId)
+
+      if @debug==true then
+         OutputLine(Concat(@startLine, 'Account RowCount: ', RowCount(@accRows), @endLine))
+      endif
+
+      if RowCount(@accRows)==1 then
+
+         var @accRow, @specialOffers, @productUpdate
+
+         set @accRow = Row(@accRows, 1)
+         set @specialOffers = Field(@accRow, 'Mktg_Alerts_Special_Offers__c')
+         set @productUpdate = Field(@accRow, 'Mktg_program_adoption_product_update__c')
+
+         if @debug==true then
+            OutputLine(Concat(@startLine, 'specialOffers: ', @specialOffers, @endLine))
+            OutputLine(Concat(@startLine, 'productUpdate: ', @productUpdate, @endLine))
+         endif
+
+      else
+
+         set @logError = 'Record not found in Account object'  
+
+      endif
+
+      var @role, 
+          @disableArrangerOffers, @disableArrangerUpdates,
+          @disableTravelerOffers, @disableTravelerUpdates,
+          @globalSpecialOffers, @globalNewsUpdate, @savedRole
+
+      set @savedRole = Lookup('ENT.Subscription Center', 'onSave: Role', 'Subscriber Key', @sk)
+
+      if @egenciaRoles == 'Arranger' or @egenciaRoles == 'Travel_Manager' then
+         set @emailTypes = 'specialOffers;newsUpdates;surveys' /*Survey addition for Traveller and Arranger*/
+         set @role = 'Arranger'
+      else
+         set @emailTypes = 'specialOffers;newsUpdates;travSurvey'  /*Survey addition for Traveller and Arranger*/
+         set @role = 'Traveler'
+      endif
+
+      if not Empty(@savedRole) and @role!=@savedRole then
+         set @role = @savedRole /* overrride */
+      endif
+
+      if @specialOffers == 'Opt out all users' 
+      or @specialOffers == 'Opt out arrangers only'
+      or empty(@specialOffers) then
+         set @disableArrangerOffers = true
+      endif
+
+      if @productUpdate == 'Opt out all users' 
+      or @productUpdate == 'Opt out arrangers only'
+      or empty(@productUpdate) then
+         set @disableArrangerUpdates = true
+      endif
+
+      if @specialOffers == 'Opt out all users' 
+      or @specialOffers == 'Opt out travelers only'
+      or empty(@specialOffers) then
+         set @disableTravelerOffers = true
+      endif
+
+      if @productUpdate == 'Opt out all users' 
+      or @productUpdate == 'Opt out travelers only'
+      or empty(@productUpdate) then
+         set @disableTravelerUpdates = true
+      endif
+
+      if @specialOffers == 'All users opted in'
+         or (@specialOffers == 'Opt out arrangers only' and @role == 'Traveler')
+         or (@specialOffers == 'Opt out travelers only' and @role == 'Arranger') then
+         set @globalSpecialOffers = true
+      endif
+
+      if @productUpdate == 'All users opted in'
+         or (@productUpdate == 'Opt out arrangers only' and @role == 'Traveler')
+         or (@productUpdate == 'Opt out travelers only' and @role == 'Arranger') then
+         set @globalNewsUpdate = true
+      endif
+
+      if @debug==true then
+         OutputLine(Concat(@startLine, 'role: ', @role, @endLine))
+         OutputLine(Concat(@startLine, 'Mktg_Alerts_Special_Offers__c: ', @specialOffers, @endLine))
+         OutputLine(Concat(@startLine, 'Mktg_program_adoption_product_update__c: ', @productUpdate, @endLine))
+
+         OutputLine(Concat(@startLine, 'disableArrangerOffers: ', @disableArrangerOffers, @endLine))
+         OutputLine(Concat(@startLine, 'disableArrangerUpdates: ', @disableArrangerUpdates, @endLine))
+         OutputLine(Concat(@startLine, 'disableTravelerOffers: ', @disableTravelerOffers, @endLine))
+         OutputLine(Concat(@startLine, 'disableTravelerUpdates: ', @disableTravelerUpdates, @endLine))
+      endif
+
+   endif /* end locate contact */
+
+   /* start form fill */
+
+   var @pageLoadObj, @subOpts, @prefRows,
+       @bestPractices, @productUpdates, @events,
+       @travelAlerts, @surveys, @newsUpdates, 
+       @specialOffers, @cloudPagesURL, @surveysRetrieve /*Survey addition for Traveller and Arranger*/
+
+   /* doing this here to encrypt params */
+
+   set @cloudPagesURL = Concat(
+                           '%%=CloudPagesURL(',@cloudPageId,
+                           ', "token", "', @token, '"',
+                           ', "sk", "', @sk, '"',
+                           ', "cid", "', @companyId, '"',
+                           ', "uid", "', @userId, '"',
+                           ', "pid", "', @principalId, '"',
+                           ', "debug", "', @debug, '"',
+                           ')=%%')
+
+   if @debug==true then
+      OutputLine(Concat(@startLine, 'cloudPagesURL: ', @cloudPagesURL, @endLine))
+   endif
+
+   if @role=='Travel_Manager' then /* get prefs in real-time for Travel Managers */
+
+      set @contactRows = RetrieveSalesforceObjects(
+      'Contact',
+      'Mktg_Alert_Best_practices__c,
+       Mktg_Alerts_Product_updates__c,
+       Mktg_Alerts_Events__c,
+       Travel_Alerts_Opt_In__c,
+       Mktg_Surveys__c,
+       HasOptedOutOfEmail,
+       Preferred_Language__c',
+      'Id', '=', @sk)
+
+      if RowCount(@contactRows) == 1 then
+
+         set @contactRow = Row(@contactRows, 1)
+         set @bestPractices = Field(@contactRow, 'Mktg_Alert_Best_practices__c')
+         set @productUpdates = Field(@contactRow, 'Mktg_Alerts_Product_updates__c')
+         set @events = Field(@contactRow, 'Mktg_Alerts_Events__c')
+         set @travelAlerts = Field(@contactRow, 'Travel_Alerts_Opt_In__c')
+         set @surveys = Field(@contactRow, 'Mktg_Surveys__c')
+         set @unsubscribe = Field(@contactRow, 'HasOptedOutOfEmail')
+         set @prefLang = Field(@contactRow, 'Preferred_Language__c')
+
+         if @debug==true then
+            OutputLine(Concat(@startLine, 'bestPractices: ', @bestPractices, @endLine))
+            OutputLine(Concat(@startLine, 'productUpdates: ', @productUpdates, @endLine))
+            OutputLine(Concat(@startLine, 'Preferred_Language__c: ', @prefLang, @endLine))
+            OutputLine(Concat(@startLine, 'events: ', @events, @endLine))
+         endif
+
+      else
+         set @logError = 'unable to retrieve Contact preferences'
+      endif
+
+   endif
+
+   set @prefRows = LookupRows('ENT.Subscription Center', 'Subscriber Key', @sk)
+
+   if RowCount(@prefRows)==1 then
+
+      var @prefRow
+      set @prefRow = Row(@prefRows, 1)
+ 
+      set @email = Field(@prefRow, 'onSave: Email Address')
+      set @unsubscribe = Field(@prefRow, 'onSave: Unsubscribe')
+      set @newsUpdates = Field(@prefRow, 'onSave: News and Updates')
+      set @specialOffers = Field(@prefRow, 'onSave: Special Offers') 
+      set @surveysRetrieve = Field(@prefRow, 'onSave: Surveys') /*Survey addition for Traveller and Arranger*/
+
+      if @globalNewsUpdate==true and @newsUpdates!=false then /* override DE prefs */
+         set @newsUpdates = true
+      endif
+
+      if @globalSpecialOffers==true and @specialOffers!=false then /* override DE prefs */
+         set @specialOffers = true
+      endif
+
+      /*Survey addition for Traveller and Arranger*/
+      if @surveysRetrieve==true and (@egenciaRoles == 'Arranger' or @egenciaRoles == 'Traveler') then /* override DE prefs */
+         set @surveysRetrieve = true
+      endif
+
+      if @role!='Travel_Manager' and RowCount(@contactRows) != 1 then 
+         set @bestPractices = Field(@prefRow, 'onSave: Best Practices')
+         set @productUpdates = Field(@prefRow, 'onSave: Product Updates')
+         set @events = Field(@prefRow, 'onSave: Events')
+         set @travelAlerts = Field(@prefRow, 'onSave: Travel Alerts')
+         set @surveys = Field(@prefRow, 'onSave: Surveys')
+      endif
+
+      if @debug==true then
+         OutputLine(Concat(@startLine, 'newsUpdates: ', @newsUpdates, @endLine))
+         OutputLine(Concat(@startLine, 'specialOffers: ', @specialOffers, @endLine))
+         OutputLine(Concat(@startLine, 'surveys: ', @surveysRetrieve, @endLine)) /*Survey addition for Traveller and Arranger*/
+         OutputLine(Concat(@startLine, 'role: ', @role, @endLine)) 
+         OutputLine(Concat(@startLine, 'contactRowCount: ', RowCount(@contactRows), @endLine))
+      endif
+
+      set @subOpts = iif(@bestPractices==true, '"Best Practices",', '')
+      set @subOpts = Concat(@subOpts, iif(@productUpdates==true, '"Product Updates",', ''))
+      set @subOpts = Concat(@subOpts, iif(@events==true, '"Events",', ''))
+      set @subOpts = Concat(@subOpts, iif(@travelAlerts==true, '"Travel Alerts",', ''))
+      set @subOpts = Concat(@subOpts, iif(@surveys==true, '"Surveys",', ''))
+      set @subOpts = Concat(@subOpts, iif(@newsUpdates==true, '"News and Updates",', ''))
+      set @subOpts = Concat(@subOpts, iif(@specialOffers==true, '"Special Offers",', ''))
+
+      set @subOpts = Substring(@subOpts,1, Subtract(Length(@subOpts),1))
+
+      set @pageLoadObj = Concat('{
+                           "email_address":"', @email,'",
+                           "role":"', @role, '",
+                           "subscription_options":[
+                              ', @subOpts, '
+                           ],
+                           "unsubscribe_all":', Lowercase(@unsubscribe), '
+                           }'))
+
+      /* strip spaces for comparison - done this for readability of above var */
+      set @pageLoadObj = ReplaceList(@pageLoadObj, '', ' ')
+
+   else /* contact does not yet exist in preference center */
+
+      if @globalNewsUpdate==true then
+         set @newsUpdates = true
+      endif
+
+      if @globalSpecialOffers==true then
+         set @specialOffers = true
+      endif
+
+      set @pageLoadObj = Concat('{
+                           "email_address":"', @emailAddr,'",
+                           "role":"', @role, '",
+                           "subscription_options":[
+                              ', @subOpts, '
+                           ],
+                           "unsubscribe_all":', Lowercase(@unsubscribe), '
+                           }'))
+
+   endif    /* end form fill */
+
+   if @debug==true then
+      OutputLine(Concat(@startLine, 'pageLoadObj: ', @pageLoadObj, @endLine))
+   endif
+
+   /* now encode */
+   set @pageLoadObj = Base64Encode(@pageLoadObj)
+
+   /* preferred langs are inconsistent, so assign corresponding lang code 
+
+   if @prefLang == 'English' then
+      set @prefLang = 'en_GB'
+   elseif @prefLang == 'German' then
+      set @prefLang = 'de_DE'
+   elseif @prefLang == 'French' then
+      set @prefLang = 'fr_FR'
+   elseif @prefLang == 'Italian' then
+      set @prefLang = 'it_IT'
+   elseif @prefLang == 'Spanish' then
+      set @prefLang = 'es_ES'
+   elseif @prefLang == 'Danish' then
+      set @prefLang = 'da_DK'
+   elseif @prefLang == 'Norwegian' then
+      set @prefLang = 'nb_NO'
+   elseif @prefLang == 'Dutch' then
+      set @prefLang = 'nl_NL'
+   elseif @prefLang == 'Polish' then
+      set @prefLang = 'pl_PL'
+   elseif @prefLang == 'Portuguese' then
+      set @prefLang = 'pt_PT'
+   elseif @prefLang == 'Finnish' then
+      set @prefLang = 'fi_FI'
+   elseif @prefLang == 'Swedish' then
+      set @prefLang = 'sv_SE'
+   elseif @prefLang == 'Turkish' then
+      set @prefLang = 'tr_TR'
+   elseif @prefLang == 'Czech' then
+      set @prefLang = 'cs_CZ'
+   elseif @prefLang == 'Chinese' then
+      set @prefLang = 'zh_CN'
+   endif */
+
+
+   if @debug==true then
+      OutputLine(Concat(@startLine, 'prefLang1: ', @prefLang, @endLine))
+   endif
+
+   var @supportedLangs
+   set @supportedLangs = 'en_GB;en_US;de_DE;fr_FR;fr_CA;it_IT;es_ES;da_DK;nb_NO;nl_NL;pl_PL;pt_PT;fi_FI;sv_SE;tr_TR;cs_CZ;zh_CN;'
+
+   if (not Empty(@prefLang) 
+       and IndexOf(@supportedLangs, Concat(@prefLang, ';')) == 0)
+   or Empty(@prefLang) then
+      set @prefLang = 'en_GB'
+   endif
+
+   if @debug==true then
+      OutputLine(Concat(@startLine, 'prefLang: ', @prefLang, @endLine))
+   endif
+
+endif /* end page load */
+
+/* should be able to use else statement to open block below
+   but OMM is confused over [correctly] nested if statements */
+
+if @submitted == 'submitted' then
+
+   var @email, @role, @bestPractices, @productUpdates, 
+       @events, @travelAlerts, @surveys, @newsUpdates, @specialOffers, @unsubscribe,
+       @msg, @pageLoadObj, @subOpts, @prefLang, @nullArrangerOffers, @nullArrangerUpdates,
+       @nullTravelerOffers, @nullTravelerUpdates      
+
+   set @prefLang = RequestParameter('prefLang')
+   set @unsubscribe = iif(RequestParameter('unsubscribe')=='on','true','false')
+   set @email = RequestParameter('email')
+   set @role = RequestParameter('role')
+  
+   set @bestPractices = iif(RequestParameter('bestPractices')=='on','true','false')
+   set @productUpdates = iif(RequestParameter('productUpdates')=='on','true','false')
+   set @events = iif(RequestParameter('events')=='on','true','false')
+   set @travelAlerts = iif(RequestParameter('travelAlerts')=='on','true','false')
+   set @surveys = iif(RequestParameter('surveys')=='on','true','false')
+   set @newsUpdates = iif(RequestParameter('newsUpdates')=='on','true','false')
+   set @specialOffers = iif(RequestParameter('specialOffers')=='on','true','false')
+
+   set @nullArrangerOffers = RequestParameter('nullArrangerOffers')
+   set @nullArrangerUpdates = RequestParameter('nullArrangerUpdates')
+   set @nullTravelerOffers = RequestParameter('nullTravelerOffers')
+   set @nullTravelerUpdates = RequestParameter('nullTravelerUpdates')
+
+   if (@role=='Traveler' and @nullTravelerUpdates==true)
+   or (@role=='Arranger' and @nullArrangerUpdates==true) then /* override */
+      set @newsUpdates = 'false'
+   endif
+
+   if (@role=='Traveler' and @nullTravelerOffers==true)
+   or (@role=='Arranger' and @nullArrangerOffers==true) then /* override */
+      set @specialOffers = 'false'
+   endif
+
+   set @pageLoadObj = Base64Decode(RequestParameter('pageLoadObj'))
+   set @sk = RequestParameter('sk')
+
+   set @subOpts = iif(@bestPractices==true, '"Best Practices",', '')
+   set @subOpts = Concat(@subOpts, iif(@productUpdates==true, '"Product Updates",', ''))
+   set @subOpts = Concat(@subOpts, iif(@events==true, '"Events",', ''))
+   set @subOpts = Concat(@subOpts, iif(@travelAlerts==true, '"Travel Alerts",', ''))
+   set @subOpts = Concat(@subOpts, iif(@surveys==true, '"Surveys",', ''))
+   set @subOpts = Concat(@subOpts, iif(@newsUpdates==true, '"News and Updates",', ''))
+   set @subOpts = Concat(@subOpts, iif(@specialOffers==true, '"Special Offers",', ''))
+   set @subOpts = Substring(@subOpts,1, Subtract(Length(@subOpts),1))
+
+   if @debug==true then
+      OutputLine(Concat(@startLine, 'unsubscribe: ', @unsubscribe, @endLine))
+      OutputLine(Concat(@startLine, 'jobid: ', jobid, @endLine))
+   endif
+]%%
+
+<script language="javascript" runat="server"> 
+
+   var unsubscribe = Variable.GetValue('@unsubscribe');
+   var jobId = Attribute.GetValue('jobid'); 
+
+       jobId = Number(jobId);
+
+   if (unsubscribe=='true' && jobid>0) { // only trigger logunsubevent if email was sent
+
+      var prox = new Script.Util.WSProxy();
+
+      var sk = Attribute.GetValue('_subscriberkey');
+      var mid = Platform.Function.AuthenticatedMemberID();
+      var email = Attribute.GetValue('emailaddr');
+      var listId = Attribute.GetValue('listid');
+      var batchId = Attribute.GetValue('_JobSubscriberBatchID');
+
+      prox.setClientId({ "ID": mid});
+
+      var props = [
+         { Name: 'SubscriberKey', Value: sk },
+         { Name: 'EmailAddress', Value: email },
+         { Name: 'JobID', Value: jobId },
+         { Name: 'ListID', Value: listId },
+         { Name: 'BatchID', Value: batchId }
+      ];
+
+      var result = prox.execute(props, 'LogUnsubEvent');
+
+       Write('LogUnsubEvent');
+
+      result = Platform.Function.Stringify(result);
+
+      var resultObj = Platform.Function.ParseJSON(result);
+
+      if(resultObj.Status!='OK') {
+         Variable.SetValue('@logError', 'failed to log unsub event: ' + result);
+      }
+
+      Variable.SetValue('@msg', 5)
+
+   } else if (unsubscribe=='true' && (jobid=='' || !jobid || jobid==0)) { //unsubscribing from profile center
+
+     var emailAddress = Platform.Request.GetQueryStringParameter('email')
+     var subscriberKey = Platform.Request.GetQueryStringParameter('sk')
+
+     var newSubscriber = {
+        EmailAddress: emailAddress,
+        SubscriberKey: subscriberKey,
+        Status: 'Unsubscribed'
+        };
+
+     var subObj = Subscriber.Init(subscriberKey);
+     var status = subObj.Upsert(newSubscriber);
+
+     if(status!='OK') {
+        Variable.SetValue('@logError', 'failed to upsert unsubscribed Subscriber');
+     }
+
+      Variable.SetValue('@msg', 5)      
+
+   } else {
+
+      Variable.SetValue('@msg', 4)
+   } // end unsubscribe
+
+   var pageLoadObj = Platform.Variable.GetValue('@pageLoadObj');
+   var obj = Platform.Function.ParseJSON(pageLoadObj);
+
+   //Platform.Response.Write('obj.unsubscribe_all: ' + obj.unsubscribe_all);
+
+   var unsubscribe = Variable.GetValue('@unsubscribe')
+   
+   // if unsub on save is false and unsub on load is true, then resubscribe
+   if ((unsubscribe != 'true') && (obj.unsubscribe_all == 1)) {
+   //Platform.Response.Write('resubscribing')
+
+      var sk = Attribute.GetValue('_subscriberkey');
+      var subObj = Subscriber.Init(sk);
+      var status = subObj.Update( {Status:'Active'} );
+
+      if(status!='OK') {
+         Variable.SetValue('@logError', 'failed to update resubscribe');
+         }
+      }
+
+   </script>
+
+
+%%[
+
+   var @pageSubmitObj
+
+   set @pageSubmitObj = Concat('{
+                        "email_address":"', @email ,'",
+                        "role":"', @role, '",
+                        "subscription_options":[
+                           ', @subOpts, '
+                        ],
+                        "unsubscribe_all":', @unsubscribe, '
+                        }')
+
+   /* strip spaces for comparison - done this for readability of above var */
+   set @pageSubmitObj = ReplaceList(@pageSubmitObj, '', ' ')
+
+   if @debug==true then
+      OutputLine(Concat(@startLine, 'pageLoadObjDecoded: ', Base64Decode(RequestParameter('pageLoadObj')), @endLine))
+      OutputLine(Concat(@startLine, 'pageSubmitObjDecoded: ', @pageSubmitObj, @endLine))
+      OutputLine(Concat(@startLine, '  pageLoadObjEncoded: ', RequestParameter('pageLoadObj'), @endLine))
+      OutputLine(Concat(@startLine, 'pageSubmitObjEncoded: ', Base64Encode(@pageSubmitObj), @endLine))
+   endif
+
+   if Substring(@sk,1,3)=='003' then /* start update record on change */
+
+      if @role=='Travel_Manager' and RequestParameter('pageLoadObj')!=Base64Encode(@pageSubmitObj) then
+
+         if @debug==true then
+            OutputLine(Concat(@startLine, 'match: ', iif(RequestParameter('pageLoadObj')!=Base64Encode(@pageSubmitObj),'true','false'), @endLine))
+         endif
+
+         var @updateContact
+
+         set @updateContact = UpdateSingleSalesforceObject(
+           'Contact', @sk,
+           'Mktg_Alert_Best_practices__c', @bestPractices,
+           'Mktg_Alerts_Product_updates__c', @productUpdates,
+           'Mktg_Alerts_Events__c', @events,
+           'Travel_Alerts_Opt_In__c', @travelAlerts,
+           'Mktg_Surveys__c', @surveys,
+           'HasOptedOutOfEmail', @unsubscribe
+           )
+
+         if @updateContact != 1 then
+            set @logError = 'failed to update Contact record in Salesforce'
+         endif
+
+      endif
+
+   endif /* end update record on change */
+
+   if @debug==true then
+      OutputLine(Concat(@startLine, 'Account Id: ', @accountId, @endLine))
+      OutputLine(Concat(@startLine, 'Role: ', @role, @endLine))
+      OutputLine(Concat(@startLine, 'update Contact record: ', @updateContact, @endLine))
+      OutputLine(Concat(@startLine, 'update Account record: ', @updateAccount, @endLine))
+      OutputLine(Concat(@startLine, 'specialOffers: ', @specialOffers, @endLine))
+      OutputLine(Concat(@startLine, 'newsUpdates: ', @newsUpdates, @endLine))
+   endif
+
+]%%
+
+<script language="javascript" runat="server"> 
+
+   var startLine = Variable.GetValue('@startLine');
+   var endLine = Variable.GetValue('@endLine');
+   var debug = Variable.GetValue('@debug');
+
+   // parse form load objects to avoid overhead of getting them again
+
+   var pageLoadObj = Platform.Variable.GetValue('@pageLoadObj');
+   var obj = Platform.Function.ParseJSON(pageLoadObj);
+
+   //Platform.Response.Write('pageLoadObj: ' + pageLoadObj);
+
+   Variable.SetValue('@onLoadEmail', obj.email_address);
+   Variable.SetValue('@onLoadRole', obj.role);
+   Variable.SetValue('@onLoadUnsubscribe', obj.unsubscribe_all);
+
+   var opts = obj.subscription_options;
+
+   //Platform.Response.Write('opts.length: ' + opts.length);
+
+   if (opts.length>0) {
+
+      var optsToStr = opts.toString();
+
+      if (optsToStr.indexOf('BestPractices')!=-1) {
+         Variable.SetValue('@onLoadBestPractices', 1);   
+      }
+      if (optsToStr.indexOf('ProductUpdates')!=-1) {
+         Variable.SetValue('@onLoadProductUpdates', 1);
+      }
+      if (optsToStr.indexOf('Events')!=-1) {
+         Variable.SetValue('@onLoadEvents', 1);
+      }
+      if (optsToStr.indexOf('TravelAlerts')!=-1) {
+         Variable.SetValue('@onLoadTravelAlerts', 1);
+      }
+      if (optsToStr.indexOf('Surveys')!=-1) {
+         Variable.SetValue('@onLoadSurveys', 1);
+      }
+      if (optsToStr.indexOf('NewsandUpdates')!=-1) {
+         Variable.SetValue('@onLoadNewsUpdates', 1);
+      }
+      if (optsToStr.indexOf('SpecialOffers')!=-1) {
+         Variable.SetValue('@onLoadSpecialOffers', 1);
+      }
+
+   }
+ 
+   // update Egencia log
+
+   var pid = Platform.Request.GetQueryStringParameter('pid');
+       pid = Number(pid);
+   var uid = Platform.Request.GetQueryStringParameter('uid');
+   //var uid = 5325887;
+   var role = Platform.Request.GetQueryStringParameter('role');
+
+   if (pid) {
+
+      //get access token
+
+      //var baseUrl = 'https://wwwegenciacom.int-maui.sb.karmalab.net';
+      //var baseUrl = 'https://www.egencia.com';
+
+      var route = '/auth-service/v1/tokens';
+      var contentType = 'application/x-www-form-urlencoded'
+      var payload = 'grant_type=client_credentials'
+      var url = baseUrl + route;
+      var headerNames = ['Accept-Encoding', 'Authorization'];
+      var headerValues = ['gzip, deflate, sdch, br', auth];
+
+      var result = HTTP.Post(url, contentType, payload, headerNames, headerValues);
+      var response = result.Response;
+      var arr = Platform.Function.ParseJSON(response[0]);
+      var accessToken = arr.access_token;
+      var type = 'USER'
+
+      Variable.SetValue('@type', type);
+
+      // format isoDate in UTC. Not straightforward in SSJS.
+
+      var now = Platform.Function.Now();
+          now.setHours(now.getHours()+6);
+      var nowToStr = Stringify(now);
+          nowToStr = nowToStr.replace('T', ' ');
+      var msLoc = nowToStr.indexOf('.');
+      var isoDate = nowToStr.substring(1, msLoc);
+
+      // build header obj
+      var header = {};
+      var actorInfo = { 'identifier': pid,
+                        'type' : type
+                      };
+      header['sub_entity_type'] = 'MARKETING_COMMUNICATION';
+      header['sub_entity_operation_type'] = 'UPDATE';
+      header['update_at'] = isoDate;
+      header['service_name'] = 'ext-sf-marketing-cloud';
+      header['actor_info'] = actorInfo; 
+
+      var data = {};
+      var preferences = {};
+      var onFormSubmit = {};
+      var subOpts=[];
+      var role = Platform.Request.GetQueryStringParameter('role');
+      var token = Platform.Request.GetQueryStringParameter('token');
+      var unsubscribe = Platform.Request.GetQueryStringParameter('unsubscribe');
+      var type = '';
+
+      // build data obj
+      data['type'] = 'SF_MARKETING_COMMUNICATION.1';
+      data['security_token'] = token;
+
+      if (role=='Traveler') {
+         var nullOffers = Platform.Request.GetQueryStringParameter('nullTravelerOffers');
+         var nullUpdates = Platform.Request.GetQueryStringParameter('nullTravelerUpdates');
+      } else if (role=='Arranger') {
+         var nullOffers = Platform.Request.GetQueryStringParameter('nullArrangerOffers');
+         var nullUpdates = Platform.Request.GetQueryStringParameter('nullArrangerUpdates');
+      }
+
+      var newsUpdates = Variable.GetValue('@newsUpdates');
+      var specialOffers = Variable.GetValue('@specialOffers');
+
+      type = 'Special Offers';
+
+      if (nullOffers && role!='Travel_Manager') {
+         subOpts.push({'type': type, 'enabled': null});
+      } else if (specialOffers=='true') {
+         subOpts.push({'type': type, 'enabled': true});
+      } else {
+         subOpts.push({'type': type, 'enabled': false});
+      }
+
+      type = 'News and Updates';
+
+      if (nullUpdates && role!='Travel_Manager') {
+         subOpts.push({'type': type, 'enabled': null});
+      } else if (newsUpdates=='true') {
+         subOpts.push({'type': type, 'enabled': true});
+      } else {
+         subOpts.push({'type': type, 'enabled': false});
+      }
+
+      if (role!='Travel_Manager') { // Traveler or Arranger
+         subOpts.push({'type': 'Best practices', 'enabled': null});
+         subOpts.push({'type': 'Product updates', 'enabled': null});
+         subOpts.push({'type': 'Events', 'enabled': null});
+         subOpts.push({'type': 'Travel Alerts', 'enabled': null});
+         subOpts.push({'type': 'Surveys', 'enabled': null});
+      } else  { // Travel_Manager
+         var bestPractices = Variable.GetValue('@bestPractices');
+         var productUpdates = Variable.GetValue('@productUpdates');
+         var events = Variable.GetValue('@events');
+         var travelAlerts = Variable.GetValue('@travelAlerts');
+         var surveys = Variable.GetValue('@surveys');
+
+         subOpts.push({'type': 'Best practices', 'enabled': bestPractices});
+         subOpts.push({'type': 'Product updates', 'enabled': productUpdates});
+         subOpts.push({'type': 'Events', 'enabled': events});
+         subOpts.push({'type': 'Travel Alerts', 'enabled': travelAlerts});
+         subOpts.push({'type': 'Surveys', 'enabled': surveys});
+      }
+
+      type = 'Unsubscribe';
+
+      if (unsubscribe=='on') {
+         subOpts.push({'type': type, 'enabled': true});
+      } else {
+         subOpts.push({'type': type, 'enabled': false});
+      }
+
+      onFormSubmit['subscription_options'] = subOpts;
+      preferences['on_form_submit'] = onFormSubmit;
+      data['preferences'] = preferences;
+
+      // assemble payload
+      var payload = {};
+      payload['header'] = header;
+      payload['data'] = data;
+      payload = Platform.Function.Stringify(payload);
+
+      route = '/user-service/v2/users/' + uid + '/audit-logs/append';
+      contentType = 'application/json';
+      headerNames = ['Accept-Encoding', 'Authorization'];
+      headerValues = ['gzip, deflate, sdch, br', 'Bearer ' + accessToken];
+
+      var resp = [0];
+
+      url = baseUrl + route;
+
+      var req = Platform.Function.HTTPPost(url, contentType, payload, false, headerNames, headerValues, resp);
+      
+      if (req!=200) {
+         Variable.SetValue('@logError', 'audit log api request failed'); 
+      }
+
+      if (debug==true) {
+         Platform.Response.Write(startLine + '---------- audit log start ----------'+ endLine);
+         Platform.Response.Write(startLine + 'access_token: ' + accessToken + endLine);
+         Platform.Response.Write(startLine + 'url: ' + url + endLine);
+         Platform.Response.Write(startLine + 'contentType: ' + contentType + endLine);
+         Platform.Response.Write(startLine + 'headerNames: ' + headerNames + endLine);
+         Platform.Response.Write(startLine + 'headerValues: ' + headerValues + endLine);
+         Platform.Response.Write(startLine + 'payload: ' + payload + endLine);
+         Platform.Response.Write(startLine + 'HTTP Status code: ' + req + endLine);
+         Platform.Response.Write(startLine + 'API response: ' + resp + endLine);
+         Platform.Response.Write(startLine + '---------- audit log end ----------'+ endLine);
+      }
+   }
+   </script>
+
+%%[
+
+   /* upsert DE */
+
+   var @companyId, @userId, @principalId, @upsertRecord
+   set @companyId = RequestParameter('cid')
+   set @userId = RequestParameter('uid')
+   set @principalId = RequestParameter('pid')
+   set @upsertRecord = UpsertData('ENT.Subscription Center', 1,
+                                  'Subscriber Key', @sk,
+                                  'onLoad: Email Address', @onLoadEmail,
+                                  'onLoad: Role', @onLoadRole,
+                                  'onLoad: Best Practices', @onLoadBestPractices,
+                                  'onLoad: Product Updates', @onLoadProductUpdates,
+                                  'onLoad: Events', @onLoadEvents,
+                                  'onLoad: Travel Alerts', @onLoadTravelAlerts,
+                                  'onLoad: Surveys', @onLoadSurveys,
+                                  'onLoad: News and Updates', @onLoadNewsUpdates,
+                                  'onLoad: Special Offers', @onLoadSpecialOffers,
+                                  'onLoad: Unsubscribe', @onLoadUnsubscribe,
+                                  'onSave: Email Address', @email,
+                                  'onSave: Role', @role,
+                                  'onSave: Best Practices', @bestPractices,
+                                  'onSave: Product Updates', @productUpdates,
+                                  'onSave: Events', @events,
+                                  'onSave: Travel Alerts', @travelAlerts,
+                                  'onSave: Surveys', @surveys,
+                                  'onSave: News and Updates', @newsUpdates,
+                                  'onSave: Special Offers', @specialOffers,
+                                  'onSave: Unsubscribe', @unsubscribe,
+                                  'IP Address', @clientIp,
+                                  'User Agent', @userAgent,
+                                  'Type', @type,
+                                  'Company Id', @companyId,
+                                  'User Id', @userId,
+                                  'Principal User Id', @principalId,
+                                  'Updated At', SystemDateToLocalDate(Now())
+                                 )
+
+   if @upsertRecord!=1 then
+      set @logError = 'failed to upsert record to Subscription Center DE'
+   endif
+
+endif /* end form submitted processing */
+
+if @debug==true then
+   OutputLine(Concat(@startLine, 'logError: ', @logError, @endLine))
+endif
+
+]%%
+
+<script language="javascript" runat="server"> 
+
+var logError = Variable.GetValue('@logError')
+
+if (!!logError) { // send email notification
+
+var prox = new Script.Util.WSProxy();
+
+var emailaddr = Variable.GetValue('@emailaddr');
+var error = Variable.GetValue('@logError');
+var subscriber = Variable.GetValue('@sk');
+var url = Platform.Request.RequestURL;
+
+var ts = {
+      TriggeredSendDefinition: {
+            CustomerKey: tsKey
+         },
+         Subscribers: [{
+            EmailAddress: tsEmail,
+            SubscriberKey: tsSk,
+            Attributes: [{
+               Name: 'Email',
+               Value: emailaddr
+            },
+            {
+               Name: 'Error',
+               Value: error
+            },
+            {
+               Name: 'SubscriberKey',
+               Value: subscriber
+            },
+            {
+               Name: 'URL',
+               Value: url
+            }]
+         }]
+      };
+
+   if (!!debug) {
+     var res = prox.createItem('TriggeredSend', ts);
+   }
+
+}
+
+</script>
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+
+    <template>
+        <div>
+            <vue-headful title="title" />
+        </div>
+    </template>
+
+    <!-- Icons -->
+    <link rel="icon" type="image/png" href="https://www.egencia.com/public/us/wp-content/themes/egencia/assets/images/favicon/favicon-32x32.png">
+
+    <!-- Bootstrap core CSS -->
+    <link rel="stylesheet" href="https://info.egencia.com/rs/949-SUD-331/images/mkto-bootstrap.css">
+    <link href="https://fonts.googleapis.com/css?family=Roboto:300,400,700" rel="stylesheet">
+
+
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vue@2.6.11"></script>
+
+    <script>
+
+      function uncheckAll() { 
+        var inputs = document.getElementsByClassName("prefs");
+        for (var i = 0; i < inputs.length; i++) { 
+            inputs[i].checked = false; 
+        } 
+    } 
+
+      function uncheckUnsub() { 
+        var input = document.getElementById("unsub");
+            input.checked = false; 
+    } 
+
+    function showType(type){
+
+      // show/hide newsUpdates & specialOffers based on values in account object
+      // fetch rules from AMPscript
+      var disableTravelerOffers = %%=iif(@disableTravelerOffers==true,'true','false')=%%;
+      var disableTravelerUpdates = %%=iif(@disableTravelerUpdates==true,'true','false')=%%;
+      var disableArrangerOffers = %%=iif(@disableArrangerOffers==true,'true','false')=%%;
+      var disableArrangerUpdates = %%=iif(@disableArrangerUpdates==true,'true','false')=%%;
+
+      var type1 = document.getElementsByClassName("travelMgr");
+      var type2 = document.getElementsByClassName("travelerOrArranger");
+      var err   = document.getElementById("error1");
+
+     %%[ if @role != 'Travel_Manager' then ]%%
+        if (type=='travelMgr') {
+         err.style.display ='block';
+           for (var i = 0; i < type1.length; i++) { 
+               type1[i].style.display ='none';
+           } 
+           for (var i = 0; i < type2.length; i++) { 
+               type2[i].style.display ='none';
+           }        
+        } else if (type=='Traveler') {
+         err.style.display ='none';
+           for (var i = 0; i < type1.length; i++) { 
+               type1[i].style.display ='none';
+           } 
+               if (disableTravelerOffers==false) {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("specialOffers").disabled=false;
+                  }
+               } else {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("specialOffers").disabled=true;
+                  }                  
+               }
+               if (disableTravelerUpdates==false) {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("newsUpdates").disabled=false;
+                  }
+               } else {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("newsUpdates").disabled=true;
+                  }                  
+               }
+               
+        } else if (type=='Arranger') {
+         err.style.display ='none';
+           for (var i = 0; i < type1.length; i++) { 
+               type1[i].style.display ='none';
+           } 
+              if (disableArrangerOffers==false) {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("specialOffers").disabled=false;
+                  }
+               } else {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("specialOffers").disabled=true;
+                  }                  
+               }
+              if (disableArrangerUpdates==false) {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("newsUpdates").disabled=false;
+                  }
+              } else {
+                  for (var i = 0; i < type2.length; i++) { 
+                  document.getElementById("newsUpdates").disabled=true;
+                  }                  
+              }
+              
+        } else { // role = Travel_Manager
+          err.style.display ='none';
+           for (var i = 0; i < type1.length; i++) { 
+               type1[i].style.display ='none';
+           } 
+           for (var i = 0; i < type2.length; i++) { 
+               type2[i].style.display ='block';
+           }           
+        }
+      %%[ endif ]%%
+    }
+
+    </script>
+
+    <style type="text/css">
+      body {
+        font-family: 'Roboto', sans-serif;
+        font-size: 1rem;
+      }
+
+    @media (min-width: 768px) {
+        /* Target devices greaten than 768px */
+        .eg-banner {
+            background-image: url("https://image.email.egencia.com/lib/fe36117075640474751077/m/1/dd51af1c-75fe-419c-afb8-a13f43af6cf8.png");
+            background-position: center top;
+            min-height: 320px;
+            background-color: #FFFFFF;
+            background-repeat: no-repeat;
+        }
+    }
+    @media only screen and (max-width:480px){
+        /* MOBILE GLOBAL STYLES - DO NOT CHANGE */
+        body, .tb_properties{font-family: Arial !important; font-size: 16px !important; color: #808080 !important; line-height: 1 !important; padding: 0px !important; }.buttonstyles{font-family: Arial !important; font-size: 16px !important; color: #FFFFFF !important; padding: 0px !important; }h1{font-family: Arial !important; font-size: 22px !important; color: #202020 !important; line-height: 1 !important; }h2{font-family: Arial !important; font-size: 20px !important; color: #202020 !important; line-height: 1 !important; }h3{font-family: Arial !important; font-size: 18px !important; color: #202020 !important; line-height: 1 !important; }a:not(.buttonstyles){line-height: 1 !important; }.mobile-hidden{display: none !important; }.responsive-td {width: 100% !important; display: block !important; padding: 0 !important;}
+        /* END OF MOBILE GLOBAL STYLES - DO NOT CHANGE */
+        #watch-menu { margin-top: 3vh; }
+    }
+
+    [v-cloak] { display: none; }
+
+    input[type=checkbox]:disabled { background: #ccc; }
+
+    .type, #error1 { display: none; }
+
+    %%[
+    var @typeRows, @typeRow, @type, @i
+    set @typeRows = BuildRowsetFromString(@emailTypes,';')
+    for @i = 1 to RowCount(@typeRows) do
+
+      set @typeRow = Row(@typeRows, @i)
+      set @type = Field(@typeRow, 1)
+    ]%%
+    .%%=v(@type)=%% { display: block; }
+    %%[ next ]%%
+
+    hr.disclaimer { border-top: 1px dashed #ccc; }
+
+    p.disclaimer { font-size: 0.9rem; }
+
+    </style>
+
+  </head>
+
+  <body class="bg-dark h-100">
+   <div v-cloak id="app">
+    <header class="bg-white py-4 py-md-4">
+      <div class="container">
+        <div class="row py-2 align-items-center">
+          <div class="col-md-10 text-center text-md-left">
+            <a href="https://www.egencia.com/public/us/" target="_blank"><img src="https://image.email.egencia.com/lib/fe36117075640474751077/m/1/8a3786a8-ee58-4487-8242-6645f732c545.png" class="mx-auto mx-md-left" style="width: 210px;" alt="Egencia Logo"></a>
+          </div>
+          <div class="col-md-2 text-md-right">
+            <div class="form-group" id="watch-menu">
+               <select class="form-control" name="preferredLanguage" @change="switchLang">
+                  <option value="en_GB" %%=iif(@prefLang=='en_GB','selected','')=%%>English (GB)</option>
+                  <option value="en_US" %%=iif(@prefLang=='en_US','selected','')=%%>English (US)</option>
+                  <option value="de_DE" %%=iif(@prefLang=='de_DE','selected','')=%%>Deutsch</option>
+                  <option value="fr_FR" %%=iif(@prefLang=='fr_FR','selected','')=%%>Français</option>
+                  <option value="fr_CA" %%=iif(@prefLang=='fr_CA','selected','')=%%>Français Canadien</option>
+                  <option value="it_IT" %%=iif(@prefLang=='it_IT','selected','')=%%>Italiano</option>
+                  <option value="es_ES" %%=iif(@prefLang=='es_ES','selected','')=%%>Español</option>
+                  <option value="da_DK" %%=iif(@prefLang=='da_DK','selected','')=%%>dansk</option>
+                  <option value="nb_NO" %%=iif(@prefLang=='nb_NO','selected','')=%%>norsk</option>
+                  <option value="nl_NL" %%=iif(@prefLang=='nl_NL','selected','')=%%>Nederlands</option>
+                  <option value="pl_PL" %%=iif(@prefLang=='pl_PL','selected','')=%%>Polskie</option>
+                  <option value="pt_PT" %%=iif(@prefLang=='pt_PT','selected','')=%%>Português</option>
+                  <option value="fi_FI" %%=iif(@prefLang=='fi_FI','selected','')=%%>Suomalainen</option>
+                  <option value="sv_SE" %%=iif(@prefLang=='sv_SE','selected','')=%%>svenska</option>
+                  <option value="tr_TR" %%=iif(@prefLang=='tr_TR','selected','')=%%>Türkçe</option>
+                  <option value="cs_CZ" %%=iif(@prefLang=='cs_CZ','selected','')=%%>čeština</option>
+                  <option value="zh_CN" %%=iif(@prefLang=='zh_CN','selected','')=%%>简体中文</option>
+               </select>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+    <section class="py-3 eg-banner">
+      <div class="container">
+        <div class="row py-3">
+          <div class="col-md-12 text-center">
+            <h1 class="text-white mb-0 text-dark py-5">{{ str. page_title }}</h1>
+          </div>
+        </div>
+      </div>
+    </section>
+
+%%[ if Empty(@msg) then ]%%
+
+    <section class="py-5 bg-white eg-body">
+      <div class="container">
+        <div class="row">
+          <div class="col-md-10 offset-md-1 col-lg-6">
+
+            <!-- FORM START  -->
+            <form action="%%=TreatAsContent(@cloudPagesURL)=%%" method="post">
+                <div class="form-group">
+                    <h3 class="font-weight-bold">{{ str.form_title }}</h3>    
+                </div>    
+                <div class="form-group">
+                    <label for="email">{{ str.email_field }}</label>
+                    <input type="email" class="form-control" value="%%=v(@emailAddr)=%%" disabled>
+                </div>  
+
+                <div class="form-group">
+                    <h3 class="font-weight-bold pt-5">{{ str.form_subtitle_1 }}</h3>    
+                </div>                              
+                <div class="form-check">
+                    <input class="form-check-input" 
+                           type="radio" name="role" 
+                           value="Traveler" 
+                           %%=iif(@role=='Traveler','checked','')=%% 
+                           %%=iif(@role=='Travel_Manager','disabled','')=%%  
+                           onclick="showType('Traveler');">
+                    <label class="form-check-label" for="roleTraveler">
+                        {{ str.form_options_1_labels | filterByNum(1) }}
+                    </label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" 
+                           type="radio" 
+                           name="role" 
+                           value="Arranger" 
+                           %%=iif(@role=='Arranger','checked','')=%%
+                           %%=iif(@role=='Travel_Manager','disabled','')=%%  
+                           onclick="showType('Arranger');">
+                    <label class="form-check-label" for="roleTravelerArranger">
+                        {{ str.form_options_1_labels | filterByNum(2) }}
+                    </label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" 
+                    type="radio" 
+                    name="role" 
+                    value="Travel_Manager" 
+                    %%=iif(@role=='Travel_Manager','checked','')=%% 
+                    %%=iif(@role!='Travel_Manager','disabled','')=%% 
+                    onclick="showType('travelMgr');">
+                    <label class="form-check-label" for="roleTravelerManager">
+                        {{ str.form_options_1_labels | filterByNum(3) }}
+                    </label>
+                </div>                
+                <div class="form-group">
+                    <h3 class="font-weight-bold pt-5">{{ str.form_subtitle_2 }}</h3>    
+                </div> 
+
+            <div v-if="str.form_options_2_labels">
+               
+                <div class="form-check mb-4 type travelMgr bestPractices">
+                    <input class="form-check-input prefs" type="checkbox" name="bestPractices" onfocus="uncheckUnsub();" 
+                    %%=iif(@bestPractices==true,'checked','')=%%>
+                    <label class="form-check-label h5" for="bestPractices">
+                       {{ str.form_options_2_labels.travel_managers | filterByNum(1) }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travel_managers | filterByNum(1) }}</div>
+                </div>
+                <div class="form-check mb-4 type travelMgr productUpdates">
+                    <input class="form-check-input prefs" type="checkbox" name="productUpdates" onfocus="uncheckUnsub();" 
+                    %%=iif(@productUpdates==true,'checked','')=%%>
+                    <label class="form-check-label h5" for="productUpdates">
+                        {{ str.form_options_2_labels.travel_managers | filterByNum(2) }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travel_managers | filterByNum(2) }}</div>
+                </div>
+                      <div class="form-check type travelMgr mb-4 events">
+                    <input class="form-check-input prefs" type="checkbox" name="events" onfocus="uncheckUnsub();" 
+                    %%=iif(@events==true,'checked','')=%%>
+                    <label class="form-check-label h5" for="events">
+                        {{ str.form_options_2_labels.travel_managers | filterByNum(3) }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travel_managers | filterByNum(3) }}</div>
+                </div>
+                <div class="form-check mb-4 type travelMgr travelAlerts">
+                    <input class="form-check-input prefs" type="checkbox" name="travelAlerts" onfocus="uncheckUnsub();" 
+                    %%=iif(@travelAlerts==true,'checked','')=%%>
+                    <label class="form-check-label h5" for="travelAlerts">
+                        {{ str.form_options_2_labels.travel_managers | filterByNum(4) }} 
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travel_managers | filterByNum(4) }}</div>
+                </div>
+                <div class="form-check mb-4 type travelMgr surveys">
+                    %%[ if (@role=='travel_manager') then ]%% <!--Survey addition for Traveller and Arranger show only for travel manager-->
+                    <input class="form-check-input prefs" type="checkbox" name="surveys" onfocus="uncheckUnsub();" 
+                    %%=iif(@surveys==true,'checked','')=%%>
+                    <label class="form-check-label h5" for="surveys">
+                     {{ str.form_options_2_labels.travel_managers | filterByNum(5) }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travel_managers | filterByNum(5) }}</div>
+                    %%[ endif ]%%
+                </div> 
+
+                <div class="form-check mb-4 type travelerOrArranger newsUpdates">
+                    <input class="form-check-input prefs" type="checkbox" name="newsUpdates" id="newsUpdates" onfocus="uncheckUnsub();" 
+                    %%=iif(@newsUpdates==true,'checked','')=%%
+                    %%[ if (@role=='Traveler' and @disableTravelerUpdates==true)
+                        or (@role=='Arranger' and @disableArrangerUpdates==true) then ]%% disabled %%[ endif ]%%> 
+                    <label class="form-check-label h5" for="newsUpdates">
+                        {{ str.form_options_2_labels.travelers_arrangers | filterByNum(1) }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travelers_arrangers | filterByNum(1) }}</div>
+                </div> 
+                <div class="form-check mb-4 type travelerOrArranger specialOffers">
+                    <input class="form-check-input prefs" type="checkbox" name="specialOffers" id="specialOffers" onfocus="uncheckUnsub();" 
+                    %%=iif(@specialOffers==true,'checked','')=%%
+                    %%[ if (@role=='Traveler' and @disableTravelerOffers==true)
+                        or (@role=='Arranger' and @disableArrangerOffers==true) then ]%% disabled %%[ endif ]%%> 
+                    <label class="form-check-label h5" for="specialOffers">
+                        {{ str.form_options_2_labels.travelers_arrangers | filterByNum(2) }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travelers_arrangers | filterByNum(2) }}</div>
+                </div>   
+
+                <!--Survey addition for Traveller and Arranger show only for traveler or arranger-->
+                <div class="form-check mb-4 type travelerOrArranger travSurvey" id="travSurveys">
+                  %%[ if (@role=='Traveler' or @role=='Arranger') then ]%%
+                  <input class="form-check-input prefs" type="checkbox" name="surveys" onfocus="uncheckUnsub();" 
+                    %%=iif(@surveysRetrieve==true,'checked','')=%%>
+                    <label class="form-check-label h5" for="surveys">
+                        {{ str.form_options_2_labels.travelers_arrangers | filterByNum(3) }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.form_options_2_descriptions.travelers_arrangers | filterByNum(3) }}</div>
+                    %%[ endif ]%%
+                  </div>     
+
+            </div> <!-- close v-if -->
+
+                <div class="form-check">
+                    <input class="form-check-input" id="unsub" type="checkbox" name="unsubscribe" 
+                    %%=iif(@unsubscribe==true,'checked','')=%% onfocus="uncheckAll();">
+
+                    <label class="form-check-label h5" for="unsubscribe">
+                        {{ str.unsubscribe_label }}
+                    </label>
+                    <div class="form-text text-muted">{{ str.unsubscribe_description }}</div>
+                </div>  
+
+                <div class="form-group mt-4">
+                    <button type="submit" class="btn btn-lg btn-warning">{{ str.form_cta }}</button>
+                </div>
+                <input type="hidden" name="submitted" value="submitted">
+                <input type="hidden" name="pageLoadObj" value="%%=v(@pageLoadObj)=%%">
+                <input type="hidden" name="prefLang" id="prefLang" value="%%=v(@prefLang)=%%">
+                <input type="hidden" name="email" value="%%=v(@emailAddr)=%%">
+                <input type="hidden" name="nullTravelerOffers" value="%%=iif(@disableTravelerOffers==true,'true','')=%%">
+                <input type="hidden" name="nullTravelerUpdates" value="%%=iif(@disableTravelerUpdates==true,'true','')=%%">
+                <input type="hidden" name="nullArrangerOffers" value="%%=iif(@disableArrangerOffers==true,'true','')=%%">
+                <input type="hidden" name="nullArrangerUpdates" value="%%=iif(@disableArrangerUpdates==true,'true','')=%%">
+                <input type="hidden" name="debug" value="%%=iif(@debug==true,'true','')=%%">
+            </form>
+            <!-- FORM END  -->
+
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="py-1 bg-white eg-body">
+      <div class="container">
+          <div class="col-md-10 offset-md-0 col-lg-9" v-if="str.form_notes">
+
+            <hr class="disclaimer" />
+
+               <div class="col-lg-10 offset-md-1" style="margin-bottom:2vh;" v-for="footnote in str.form_notes.%%=iif(@role=='Travel_Manager', 'travel_managers', 'travelers_arrangers')=%%">
+
+                 <p class="disclaimer"><strong>{{ footnote.heading }}</strong>
+                 <br />{{ footnote.note }}</p>
+
+               </div>
+
+          </div>
+        </div>
+    </section>
+
+%%[ else ]%%
+
+    <section class="py-5 bg-white eg-body">
+      <div class="container" style="height: 200px;">
+          <div class="col-md-12 text-center">
+
+              <h4>{{ str.messages | filterByNum(%%=v(@msg)=%%) }}</h4>
+
+          </div>
+        </div>
+    </section>
+
+%%[ endif ]%%
+
+    <footer class="py-4 text-left bg-dark" style="background-color: #152835!important;">
+        <div class="container">
+            <div class="row mb-3">
+                <div class="col-lg-12">
+                    <a v-if="str.privacy_policy" v-bind:href="str.privacy_policy.link" class="text-white-50">{{ str.privacy_policy.label }}</a>
+                    <a v-if="str.terms_of_service" v-bind:href="str.terms_of_service.link" class="text-white-50">{{ str.terms_of_service.label }}</a>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col-lg-12">
+                    <small class="text-white-50">&copy; %%=DatePart(Now(), "Y")=%% Egencia LLC. All rights reserved. <br>GBT Travel Services UK Limited (GBT UK) and its authorised sublicensees (including Ovation Travel Group and Egencia) use certain trademarks and service marks of American Express Company or its subsidiaries (American Express) in the 'American Express Global Business Travel' and 'American Express Meetings &amp; Events' brands and in connection with its business for permitted uses only under a limited licence from American Express (Licensed Marks). The Licensed Marks are trademarks or service marks of, and the property of, American Express. GBT UK is a subsidiary of Global Business Travel Group, Inc. (NYSE: GBTG). American Express holds a minority interest in GBTG, which operates as a separate company from American Express.</small>
+                </div>
+            </div>
+        </div>
+    </footer>
+</div>
+
+    <script>
+
+    new Vue({
+       el: '#app',
+       filters: {
+          filterByNum: function(values, num) {
+             if (Array.isArray(values)) {
+                return values[num - 1];
+             }
+          }
+       },
+       methods:{
+         switchLang(event){
+            %%[ if @submitted != 'submitted' and @msg != 1 then ]%%
+            document.getElementById('prefLang').value = event.target.value; // set hidden field for form submit
+            %%[ endif ]%%
+            axios
+               .get('https://cloud.email.egencia.com/'+ event.target.value + '_strings')
+               .then(response => (this.str = response.data))
+         }
+       },
+       data() {
+          return {
+             str: {},
+             preferredLanguage : '%%=v(@prefLang)=%%' // set default lang
+          }
+       },
+       mounted() {
+          axios
+          .get('https://cloud.email.egencia.com/en_gb_json')
+          .then(response => (this.str = response.data))
+       }
+    })
+
+    </script>
+
+
+    <!-- Bootstrap core JavaScript
+    ================================================== -->
+    <!-- Placed at the end of the document so the pages load faster -->
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.1.3/js/bootstrap.min.js" integrity="sha384-ChfqqxuZUCnJSK3+MXmPNIyE6ZbWh2IMqE241rYiqJxyMiZ6OW/JmZQ5stwEULTy" crossorigin="anonymous"></script>
+
+  
+<script>(function(a,m,i,g,o,s){o=a.createElement(g);s=a.getElementsByTagName(i)[0];o.src=m.origin+m.pathname+"/_t?eventType=CLOUDPAGESVISIT";o.width=0;o.height=0;o.style.display="none";s.appendChild(o);})(document,window.location,"body","img");</script>
+
+ <script src="https:&#x2F;&#x2F;500009047.collect.igodigital.com&#x2F;collect.js"></script>
+ <script>
+  if (_etmc && typeof _etmc.push === 'function') {
+   _etmc.push(['setOrgId', '500009047']);
+   _etmc.push(['trackPageView']);
+  }
+ </script>
+
+</body>
+</html>
